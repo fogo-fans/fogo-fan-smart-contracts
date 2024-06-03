@@ -4,6 +4,8 @@ pragma abicoder v2;
 
 import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./interfaces/IReferralCalculator.sol";
 
 
 interface IWETH {
@@ -28,14 +30,16 @@ interface IWMATIC {
     function withdraw(uint wad) external;
 }
 
-contract SubscriptionContract {
+
+contract SubscriptionContract is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     ISwapRouter public immutable swapRouter;
     IWETH private weth;
+    IReferralCalculator public referralCalculator;
 
-    address private constant ROUTER_ADDRESS =
-        0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address public CALCULATOR_ADDRESS = 0xA5Ba50C49A2FcA03F5Fe025added1F71b8deA26a;
+    address private constant ROUTER_ADDRESS = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
     address public constant WMATIC = 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270; // Polygon WMATIC
     address public outputToken = 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359; // USDC Token on Polygon Mainnet
 
@@ -47,14 +51,14 @@ contract SubscriptionContract {
 
     address public owner;
     address public broker;
-    uint256 public brokerShare; // Broker's percentage share (0-100)
 
     event SubscriptionSuccessful(
         uint256 contentId,
         address indexed subscriber,
         address indexed contentCreator,
         uint256 usdcAmount,
-        uint256 indexed offeringId
+        uint256 indexed offeringId,
+        uint256 userId
     );
 
     modifier onlyOwner() {
@@ -63,16 +67,20 @@ contract SubscriptionContract {
     }
 
     constructor() {
+        // Shares are multiplied by 10 to manage decimals
+
         owner = msg.sender;
         broker = msg.sender;
-        brokerShare = 20;
+        // brokerShare = 200;
         swapRouter = ISwapRouter(ROUTER_ADDRESS);
         weth = IWETH(WMATIC);
+        referralCalculator = IReferralCalculator(CALCULATOR_ADDRESS);
     }
 
     struct subscriptionDetails {
         uint256 _contentId;
         address _contentCreator;
+        uint256 _userId;
         uint256 _offeringId;
         address _inputToken;
         uint256 _outputAmount;
@@ -80,7 +88,17 @@ contract SubscriptionContract {
         bool _gasDeposit;
     }
 
-    function subscribe(subscriptionDetails memory details) external payable {
+    struct referralDetails {
+        address _parent;
+        address _grandparent;
+        uint256 _yearsVerified; 
+        bool _creatorIsAmbassador;
+        bool _parentIsAmbassador;
+        bool _grandparentIsAmbassador;
+    }
+
+
+    function subscribe(subscriptionDetails memory details, referralDetails memory referral) external payable nonReentrant {
         require(
             details._contentCreator != address(0),
             "Creator's address can't be zero"
@@ -131,9 +149,25 @@ contract SubscriptionContract {
                 transferMATICBalance(details._contentCreator);
             }
         }
+
+        /* Call function to calculate final profit splits */
+        (uint256 finalBrokerShare, IReferralCalculator.referralRewards memory rewards) = calculateProfitShares(referral);
+
         /* Calculate and transfer broker USDC payment */
-        uint256 brokerPayment = (details._outputAmount * brokerShare) / 100;
+        uint256 brokerPayment = (details._outputAmount * finalBrokerShare) / 1000;
         IERC20(outputToken).safeTransfer(broker, brokerPayment);
+
+        /* Calculate and transfer parent referral USDC payment */
+        if(referral._parent != address(0)) {
+            uint256 parentReferralPayment = (details._outputAmount * rewards.parentReferralShare) / 1000;
+            IERC20(outputToken).safeTransfer(referral._parent , parentReferralPayment);  
+        }
+
+        /* Calculate and transfer grandparent referral USDC payment */
+        if(referral._grandparent != address(0)) {
+            uint256 grandparentReferralPayment = (details._outputAmount * rewards.grandparentReferralShare) / 1000;
+            IERC20(outputToken).safeTransfer(referral._grandparent , grandparentReferralPayment);       
+        }
 
         /* Transfer remaining USDC balance to content creator. */
         uint256 creatorPayment = IERC20(outputToken).balanceOf(address(this));
@@ -144,9 +178,27 @@ contract SubscriptionContract {
             msg.sender,
             details._contentCreator,
             details._outputAmount,
-            details._offeringId
+            details._offeringId,
+            details._userId
         );
     }
+
+    function calculateProfitShares(referralDetails memory details) internal view returns (uint256, IReferralCalculator.referralRewards memory){
+        IReferralCalculator.referralDetails memory referral = IReferralCalculator.referralDetails({
+            _parent: details._parent,
+            _grandparent: details._grandparent,
+            _yearsVerified: details._yearsVerified,
+            _creatorIsAmbassador: details._creatorIsAmbassador,
+            _parentIsAmbassador: details._parentIsAmbassador,
+            _grandparentIsAmbassador: details._grandparentIsAmbassador
+        });
+
+        (uint256 finalBrokerShare, IReferralCalculator.referralRewards memory rewards) = referralCalculator.calculateProfitShares(referral);
+
+        return (finalBrokerShare, rewards);
+
+    }
+
 
     function exactOutputSingleToken(
         uint256 outputTokenAmount,
@@ -239,11 +291,6 @@ contract SubscriptionContract {
         require(success, "refund failed");
     }
 
-    function updateBrokerShare(uint256 _newShare) external onlyOwner {
-        require(_newShare <= 100, "Broker share cannot be over 100%");
-        brokerShare = _newShare;
-    }
-
     function updateBrokerAddress(address _newAddress) external onlyOwner {
         require(_newAddress != address(0), "Address cannot be zero");
         broker = _newAddress;
@@ -252,6 +299,11 @@ contract SubscriptionContract {
     function updateOutputToken(address _newAddress) external onlyOwner {
         require(_newAddress != address(0), "Address cannot be zero");
         outputToken = _newAddress;
+    }
+
+    function updateCalculatorContract(address _newContract) external onlyOwner {
+        require(_newContract != address(0), "Address cannot be zero");
+        CALCULATOR_ADDRESS = _newContract;
     }
 
     function updateGasDepositAmount(uint256 newGasAmount) external onlyOwner {
